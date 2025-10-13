@@ -96,6 +96,8 @@ def extract_invoice_data(text: str) -> dict:
         # Goods and Codes
         "goods": [{
             "description": find(r"Description\s*of\s*Goods.*?1\s*(.*?)\s*\d+\s*PCS", flags=re.IGNORECASE | re.DOTALL),
+            "no_of_units": find(r"1\s+(?:Cotton\s+T-Shirts\s+)?(\d+\s+PCS)"),
+            "rate_per": find(r"(\d+\s+PCS\s+.*?US\s+Dollars)"),
             "amount": find(r"Total\s*[:\-]?\s*(USD\s*\d+)")
         }],
         
@@ -233,6 +235,32 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
     c.drawString(70, h - 412, "Vessel/Voyage:")
     c.setFont("Helvetica", 9)
     draw_wrapped(data.get("vessel_voyage", ""), 70, h - 620, 450)
+
+        # 🟩 BL NUMBER
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(450, h - 390, f"B/L NO.: {data.get('invoice_no', '')}")
+
+    # 🟩 PRODUCT DESCRIPTION
+    c.setFont("Helvetica", 9)
+
+    y_start = h - 580   # Starting y-position
+    line_spacing = 15   # Vertical spacing between text lines
+    item_spacing = 60   # Space between different goods
+
+    for i, good in enumerate(data.get("goods", [])):
+        description = good.get("description", "")
+        no_of_units = good.get("no_of_units", "")
+        rate_per = good.get("rate_per", "")
+        amount = good.get("amount", "")
+
+        # Calculate current block's Y starting point
+        y_pos = y_start - (i * item_spacing)
+
+        # Draw each field line by line
+        c.drawString(300, y_pos, f"{i+1}. Description of Goods: {description}")
+        c.drawString(300, y_pos - line_spacing, f"No. of Units: {no_of_units}")
+        c.drawString(300, y_pos - 2 * line_spacing, f"Rate: {rate_per}")
+        c.drawString(300, y_pos - 3 * line_spacing, f"Amount: {amount}")
 
     c.save()
     return buffer.getvalue()
