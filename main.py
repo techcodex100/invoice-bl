@@ -143,21 +143,37 @@ def extract_invoice_data(text: str) -> dict:
         exporter_block = re.sub(r'\n{3,}', '\n\n', exporter_block)
         exporter_block = exporter_block.strip()
 
+        # Remove plain PO lines like 'PO-123456' which sometimes appear in exporter block
+        if exporter_block:
+            exporter_block = re.sub(r'(?mi)^\s*PO[-\s]*\d+\b.*$\n?', '', exporter_block)
+            exporter_block = exporter_block.strip()
+
     # --- Split exporter block into name + address for structured output ---
     exporter_name = ""
     exporter_address = ""
     if exporter_block:
         lines = [ln.strip() for ln in re.split(r'[\r\n]+', exporter_block) if ln.strip()]
         if lines:
-            # Heuristic: prefer the first short line as company name; otherwise first line
-            candidate = lines[0]
-            if len(candidate) > 60 and len(lines) > 1:
-                candidate = lines[1]
-                rest = lines[0:1] + lines[2:]
-            else:
-                rest = lines[1:]
+            # Prefer a company-like line (contains company tokens or uppercase short name)
+            company_token = re.compile(r'\b(IMPEX|PVT|LTD|LLP|LLC|TRADING|EXPORTS|IMPORTS|CO\.|COMPANY|INDIA)\b', re.IGNORECASE)
+            candidate = None
+            for ln in lines:
+                if company_token.search(ln) or re.match(r'^[A-Z0-9 &,\-\.]{{3,}}$', ln):
+                    candidate = ln
+                    break
+            # if none found, prefer a short non-address first line
+            if not candidate:
+                for ln in lines:
+                    if not looks_like_address(ln) and len(ln) <= 60:
+                        candidate = ln
+                        break
+            # fallback to first line
+            if not candidate:
+                candidate = lines[0]
+            # remaining lines are address
+            remaining = [l for l in lines if l != candidate]
             exporter_name = candidate
-            exporter_address = "\n".join(rest).strip()
+            exporter_address = "\n".join(remaining).strip()
         # Fallbacks
         exporter_name = exporter_name or (lines[0] if lines else exporter_block)
         exporter_address = exporter_address or ("\n".join(lines[1:]) if len(lines) > 1 else "")
@@ -238,6 +254,36 @@ def extract_invoice_data(text: str) -> dict:
                 exporter_address = exporter_address or "\n".join(all_lines[idx+1:]).strip()
             except ValueError:
                 exporter_address = exporter_address or ""
+
+    # FINAL FALLBACK: search anywhere in raw for a company-like token (IMPEX/PVT/LTD/LLC/TRADING)
+    # This helps when earlier block parsing misses a top-line company name.
+    if not exporter_name:
+        company_match = re.search(r'^(.*(?:IMPEX|PVT|LTD|LLP|LLC|TRADING|EXPORTS|IMPORTS|COMPANY|CO\.)[^\n]*)$', raw, re.IGNORECASE | re.MULTILINE)
+        if company_match:
+            candidate = company_match.group(1).strip()
+            # avoid accidental headings
+            if not re.search(r'^(INVOICE|BILL|TAX)$', candidate, re.IGNORECASE):
+                exporter_name = candidate
+                # try to set exporter_address from nearby lines (lines following the candidate)
+                all_lines = [l.strip() for l in re.split(r'[\r\n]+', raw) if l.strip()]
+                try:
+                    idx = all_lines.index(candidate)
+                    exporter_address = exporter_address or "\n".join(all_lines[idx+1:idx+5]).strip()
+                except ValueError:
+                    pass
+
+    # EXTRA: if still not found, try a simple labeled 'Exporter:' line (common layouts)
+    if not exporter_name:
+        m = re.search(r'Exporter\s*[:\-]?\s*(.+)', raw, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip().split('\n')[0].strip()
+            if candidate and not re.search(r'^(INVOICE|BILL|TAX)$', candidate, re.IGNORECASE):
+                exporter_name = candidate
+                # try to set exporter_address from the exporter_block if present
+                if exporter_block and not exporter_address:
+                    lines = [ln.strip() for ln in re.split(r'[\r\n]+', exporter_block) if ln.strip()]
+                    if lines and lines[0] == candidate:
+                        exporter_address = "\n".join(lines[1:]).strip()
 
     # Notify Party: mirror Consignee if missing or marked same as consignee
     if (not notify_block or re.search(r'same as consignee', notify_block, re.IGNORECASE)):
@@ -503,11 +549,28 @@ def extract_invoice_data(text: str) -> dict:
     delivery_agent = random.choice(agents)
 
     # ✅ STRUCTURED OUTPUT
+    # Final fallback: ensure exporter_name is populated if still empty by scanning exporter_block or raw
+    if not exporter_name:
+        # try first line from exporter_block
+        if exporter_block:
+            lines = [ln.strip() for ln in re.split(r'[\r\n]+', exporter_block) if ln.strip()]
+            for ln in lines:
+                if ln and not re.search(r'^(Invoice|PO|I\.?E\.?|Buyer)', ln, re.IGNORECASE):
+                    exporter_name = ln
+                    break
+        # try labeled 'Exporter:' in raw text
+        if not exporter_name:
+            m = re.search(r'Exporter\s*[:\-]?\s*(.+)', raw, FLAGS)
+            if m:
+                candidate = m.group(1).splitlines()[0].strip()
+                if candidate and not re.search(r'^(Invoice|PO|I\.?E\.?|Buyer)', candidate, re.IGNORECASE):
+                    exporter_name = candidate
     return {
         "invoice_no": invoice_no,
         "ie_code": ie_code,
         "po_no": po_no,
         "exporter": exporter_block,
+        "exporter_address": exporter_address,
         "exporter_name": exporter_name,
         "consignee": consignee_block,
         "notify_party": notify_block,
@@ -625,7 +688,7 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
 
     # SHIPPER
     c.setFont("Helvetica-Bold", 10)
-    c.drawString(70, h - 72, "EXPORTER / SHIPPER:")
+    c.drawString(70, h - 72, " SHIPPER:")
     c.setFont("Helvetica", 9)
     # Prepare exporter display values and sanitize placeholder labels
     exp_name = (data.get("exporter_name") or "").strip()
@@ -637,6 +700,8 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
         exp_block = re.sub(r'(?mi)^\s*Buyer\'?s\s*Order\s*No\.?\s*[:\-]?.*$\n?', '', exp_block)
         exp_block = re.sub(r'(?mi)^\s*I\.?E\.?\s*Code\.?\s*[:\-]?.*$\n?', '', exp_block)
         exp_block = re.sub(r'(?mi)^\s*I\.E\.?\s*Code\.?\s*[:\-]?.*$\n?', '', exp_block)
+        # Remove leading 'Exporter:' or 'Shipper:' labels if present so splitting yields name + address
+        exp_block = re.sub(r'(?mi)^(?:Exporter|Shipper)\s*:?\s*', '', exp_block)
         exp_block = exp_block.strip()
     # remove accidental literal headings
     exp_name = re.sub(r'(?i)^Exporter\s*:?\s*$', '', exp_name).strip()
@@ -658,7 +723,83 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
                 exp_address = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
 
     # Draw exporter name (bold) then address (regular)
-    exp_y_top = h - 96
+    # Sanitize exporter name/address: remove invoice, PO, I.E. Code lines if present
+    def remove_invoice_po_ie(text: str) -> str:
+        if not text:
+            return ""
+        lines = [ln for ln in re.split(r'[\r\n]+', text) if ln.strip()]
+        filtered = []
+        for ln in lines:
+            if re.search(r'Invoice\s*No\.?|Buyer\'?s\s*Order|I\.?E\.?\s*Code|I\.E\.\s*Code', ln, re.IGNORECASE):
+                continue
+            filtered.append(ln)
+        return "\n".join(filtered).strip()
+
+    exp_name = remove_invoice_po_ie(exp_name)
+    exp_address = remove_invoice_po_ie(exp_address)
+
+    exp_y_top = h - 84  # slightly higher (move exporter box up)
+    # If exporter name missing but we have an exporter_address or exporter block,
+    # try to derive a company-like name so SHIPPER shows both name and address.
+    if not exp_name:
+        company_token = re.compile(r'\b(IMPEX|PVT|LTD|LLP|LLC|TRADING|EXPORTS|IMPORTS|CO\.|COMPANY|INDIA)\b', re.IGNORECASE)
+        # Try to extract from the explicit exporter_address returned by extractor
+        if exp_address:
+            addr_lines = [ln.strip() for ln in re.split(r'[\r\n]+', exp_address) if ln.strip()]
+            candidate = None
+            for ln in addr_lines:
+                # prefer lines that look like a company
+                if company_token.search(ln) or re.match(r'^[A-Z][A-Za-z0-9&\-,\. ]{2,}$', ln):
+                    candidate = ln
+                    break
+            # fallback: title-case or short first line
+            if not candidate and addr_lines:
+                for ln in addr_lines:
+                    if re.match(r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)+', ln):
+                        candidate = ln
+                        break
+            if candidate:
+                # remove candidate from address and set as name
+                exp_name = candidate
+                try:
+                    # remove only the first occurrence
+                    idx = addr_lines.index(candidate)
+                    remaining = addr_lines[:idx] + addr_lines[idx+1:]
+                    exp_address = '\n'.join(remaining).strip()
+                except ValueError:
+                    # safest fallback
+                    exp_address = '\n'.join([l for l in addr_lines if l != candidate]).strip()
+        # If still not found, try to use the raw exporter block
+        if not exp_name and exp_block:
+            lines = [ln.strip() for ln in re.split(r'[\r\n]+', exp_block) if ln.strip()]
+            if lines:
+                exp_name = lines[0]
+                exp_address = exp_address or '\n'.join(lines[1:]).strip()
+    # Final aggressive fallback: scan other data fields for a company-like name (sometimes extractor puts name elsewhere)
+    if not exp_name:
+        company_token = re.compile(r'\b(IMPEX|PVT|LTD|LLP|LLC|TRADING|EXPORTS|IMPORTS|CO\.|COMPANY|SHARDHA|SHRADHA|IMPEX|EXPORTS|INDIA)\b', re.IGNORECASE)
+        candidate = None
+        # Search through string fields in data (consignee/notify/etc.) for a likely exporter name
+        for k, v in data.items():
+            if not v or not isinstance(v, str):
+                continue
+            # skip fields that are obviously consignee/notify or vessel info
+            if k in ('consignee', 'notify_party'):
+                continue
+            for ln in [l.strip() for l in re.split(r'[\r\n]+', v) if l.strip()]:
+                # skip generic headings
+                if re.search(r'^(INVOICE|BILL|TAX|DATE|PLACE|PORT)\b', ln, re.IGNORECASE):
+                    continue
+                if company_token.search(ln) or re.match(r'^[A-Z][A-Z0-9 &,\-\.]{2,}$', ln):
+                    candidate = ln
+                    break
+            if candidate:
+                break
+        if candidate:
+            exp_name = candidate
+            # remove candidate line from exporter block/address if present
+            if candidate and exp_address and candidate in exp_address:
+                exp_address = '\n'.join([l for l in re.split(r'[\r\n]+', exp_address) if l.strip() and l.strip() != candidate]).strip()
     if exp_name:
         c.setFont("Helvetica-Bold", 9)
         draw_wrapped(exp_name, 70, exp_y_top, 350)
@@ -758,6 +899,8 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
         desc = good.get('description','') or ''
         # Normalize newlines and split
         desc_lines = [ln.strip() for ln in re.split(r'\r?\n', desc) if ln.strip()]
+    # remove container & seal lines that sometimes appear in the description column
+        desc_lines = [ln for ln in desc_lines if not re.search(r'Container\s*&\s*Seal|Container\s&\sSeal|Container\s*&\s*Seal\snos?', ln, re.IGNORECASE)]
         # If description contains HS CODE as a line, try to move any product-name lines above it
         hs_idx = None
         for idx, ln in enumerate(desc_lines):
@@ -776,6 +919,7 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
         # Numeric columns – units and rate only (no amount in this column)
         units_x = right_box_x
         rate_x = units_x + 100
+    
         draw_wrapped(str(good.get('units_mt','')), units_x, row_y, 80)
         draw_wrapped(str(good.get('rate','')), rate_x, row_y, 80)
         # Weight & Measurements details in the far-right narrow column
@@ -792,13 +936,14 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
     data_font = "Helvetica"
     data_size = 9
     # Draw heading (above) then data (below) with wrapping limits
-    heading_y = footer_y + 18
-    data_y = footer_y - 6
+    heading_y = footer_y + 20
+    # place data directly beneath the heading with a small gap
+    data_y = heading_y - 14
     c.setFont(heading_font, heading_size)
     c.drawString(70, heading_y, "DELIVERY AGENT:")
     c.setFont(data_font, data_size)
     # left area: start at x=200, width ~420, limit to 3 lines to avoid overflow
-    draw_wrapped_box(data.get("delivery_agent", ""), 200, data_y, 420, max_lines=3, align='left', font=data_font, font_size=data_size)
+    draw_wrapped_box(data.get("delivery_agent", ""), 150, data_y, 380, max_lines=3, align='left', font=data_font, font_size=data_size)
 
     from datetime import datetime
     place = (data.get("port_of_loading") or data.get("place_of_receipt") or "").strip()
