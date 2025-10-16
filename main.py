@@ -101,9 +101,38 @@ def extract_invoice_data(text: str) -> dict:
             m = re.search(r'Consignee\s*[:\-]?\s*([\s\S]{10,500}?)(?=Notify|Country|Port|Vessel|$)', raw, FLAGS)
             consignee_block = (m.group(1).strip() if m else "")
 
-    # Clean IE/IEC lines and heading labels out of shipper/exporter block
+
+    # Split exporter into name/address. Prefer first meaningful company-like line.
+    exporter_name = ""
+    exporter_address = ""
     if exporter_block:
-        exporter_block = re.sub(r'(?mi)^.*\bI\.?E\.?C\.?\b.*$\n?', '', exporter_block)
+        lines = [ln.strip() for ln in re.split(r'[\r\n]+', exporter_block) if ln.strip()]
+        if lines:
+            # pick first candidate that looks like a company (not 'INVOICE')
+            candidate = None
+            for ln in lines:
+                if re.search(r'Invoice|Bill\s*of\s*Lading|B/L|Date|Tax|GST', ln, re.IGNORECASE):
+                    continue
+                candidate = ln
+                break
+            if not candidate:
+                candidate = lines[0]
+            exporter_name = re.sub(r'(?mi)^(?:Exporter|Shipper)\s*:?\s*', '', candidate).strip()
+            exporter_address = "\n".join([l for l in lines if l != candidate]).strip()
+
+    # If exporter name is missing or is a generic placeholder, try to extract from top of document
+    if not exporter_name or exporter_name.strip().lower() in ('invoice', 'exporter', 'shipper', 'seller'):
+        m = re.search(r'^(.*?)(?=\n\s*(?:Consignee|Notify\s*Party|Invoice\s*No\.?|I\.?E\.?\s*Code|$))', raw, re.IGNORECASE | re.DOTALL)
+        if m:
+            top_block = m.group(1).strip()
+            top_lines = [ln.strip() for ln in re.split(r'[\r\n]+', top_block) if ln.strip()]
+            for ln in top_lines:
+                if len(ln) > 2 and not re.search(r'Invoice|Bill\s*of\s*Lading|B/L|Date', ln, re.IGNORECASE):
+                    exporter_name = exporter_name or ln
+                    # set remaining as address
+                    rest = [l for l in top_lines if l != ln]
+                    exporter_address = exporter_address or "\n".join(rest).strip()
+                    break
         exporter_block = re.sub(r'(?mi)^.*\bI\.?E\.?\s*Code.*$\n?', '', exporter_block)
         # Remove Invoice No / Buyer's Order No lines if accidentally captured
         exporter_block = re.sub(r'(?mi)^.*\bInvoice\s*No\.?\b.*$\n?', '', exporter_block)
@@ -114,16 +143,114 @@ def extract_invoice_data(text: str) -> dict:
         exporter_block = re.sub(r'\n{3,}', '\n\n', exporter_block)
         exporter_block = exporter_block.strip()
 
-    # Use full exporter block (name + address) for Bill of Lading
-    exporter_name = exporter_block
+    # --- Split exporter block into name + address for structured output ---
+    exporter_name = ""
+    exporter_address = ""
+    if exporter_block:
+        lines = [ln.strip() for ln in re.split(r'[\r\n]+', exporter_block) if ln.strip()]
+        if lines:
+            # Heuristic: prefer the first short line as company name; otherwise first line
+            candidate = lines[0]
+            if len(candidate) > 60 and len(lines) > 1:
+                candidate = lines[1]
+                rest = lines[0:1] + lines[2:]
+            else:
+                rest = lines[1:]
+            exporter_name = candidate
+            exporter_address = "\n".join(rest).strip()
+        # Fallbacks
+        exporter_name = exporter_name or (lines[0] if lines else exporter_block)
+        exporter_address = exporter_address or ("\n".join(lines[1:]) if len(lines) > 1 else "")
+
+    # If exporter_name is missing or appears to be an address (e.g. starts with 'Plot', contains 'GIDC' or long numeric address),
+    # try a fallback: take the top-of-document block until common labels (Consignee/Notify/Invoice) and use its first line as name.
+    def looks_like_address(s: str) -> bool:
+        return bool(re.search(r'\bPlot\b|\bGIDC\b|\bIndustrial\b|\bEstate\b|\bPhase\b|\bIndia\b|\d{3,}', s, re.IGNORECASE))
+
+    if not exporter_name or looks_like_address(exporter_name):
+        top_block = ""
+        m_top = re.search(r'^(.*?)(?=\bConsignee\b|\bNotify\s*Party\b|\bInvoice\s*No\.?|\bBuyer\'?s\s*Order\b|\bCountry\b)', raw, FLAGS)
+        if m_top:
+            top_block = m_top.group(1).strip()
+        # Clean common headings from the top block
+        if top_block:
+            top_lines = [ln.strip() for ln in re.split(r'[\r\n]+', top_block) if ln.strip()]
+            # remove leading labels/headings if present
+            if top_lines and re.search(r'^(Exporter|Shipper|INVOICE|BILL|TAX)', top_lines[0], re.IGNORECASE):
+                # drop obvious heading line
+                top_lines = top_lines[1:]
+
+            # helper to detect likely company name lines
+            def is_company_line(s: str) -> bool:
+                if not s or len(s) < 3:
+                    return False
+                # exclude very generic single words
+                deny = [r'INVOICE', r'BILL', r'TAX', r'GST', r'AMOUNT', r'DATE']
+                if any(re.search(d, s, re.IGNORECASE) for d in deny):
+                    return False
+                # must contain letters and at least one space (two words) and not look like an address
+                if re.search(r'[A-Za-z]', s) and len(s.split()) >= 1 and not looks_like_address(s):
+                    # prefer shortish company-like lines
+                    return len(s) <= 80
+                return False
+
+            candidate = None
+            for ln in top_lines:
+                if is_company_line(ln):
+                    candidate = ln
+                    break
+            if not candidate and top_lines:
+                # fallback to first non-empty top line
+                candidate = top_lines[0]
+
+            if candidate:
+                exporter_name = candidate
+                # exporter_address: remaining top lines excluding the chosen candidate and any heading-like lines
+                remaining = [ln for ln in top_lines if ln != candidate and not re.search(r'^(Exporter|Shipper|INVOICE|BILL|TAX)', ln, re.IGNORECASE)]
+                exporter_address = exporter_address or "\n".join(remaining).strip()
+
+    # Extra fallback: sometimes OCR/text layouts put a standalone 'INVOICE' or other heading first.
+    # If exporter_name is still missing or equals 'INVOICE', scan the raw text before 'Consignee' for a company-like line.
+    if not exporter_name or re.search(r'INVOICE', exporter_name, re.IGNORECASE):
+        pre_cons_block = raw
+        m_cons = re.search(r'(.*?)(?=\bConsignee\b|\bNotify\s*Party\b|\bInvoice\s*No\.?|\bBuyer\'??s\s*Order\b)', raw, FLAGS)
+        if m_cons:
+            pre_cons_block = m_cons.group(1)
+        candidate = None
+        for ln in [l.strip() for l in re.split(r'[\r\n]+', pre_cons_block) if l.strip()]:
+            # skip generic headings
+            if re.search(r'^(INVOICE|BILL|TAX|STATEMENT)$', ln, re.IGNORECASE):
+                continue
+            # prefer lines containing common company tokens or uppercase style
+            if re.search(r'\b(IMPEX|PVT|LTD|LLC|COMPANY|TRADING|EXPORTS|IMPORTS|INDIA|GMBH)\b', ln, re.IGNORECASE) or re.match(r'^[A-Z0-9 &,\-\.]{3,}$', ln):
+                candidate = ln
+                break
+            # Title-case company name (like 'Shraddha Impex')
+            if re.match(r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)+', ln):
+                candidate = ln
+                break
+        if candidate:
+            exporter_name = candidate
+            # build address from lines after candidate
+            all_lines = [l.strip() for l in re.split(r'[\r\n]+', pre_cons_block) if l.strip()]
+            try:
+                idx = all_lines.index(candidate)
+                exporter_address = exporter_address or "\n".join(all_lines[idx+1:]).strip()
+            except ValueError:
+                exporter_address = exporter_address or ""
 
     # Notify Party: mirror Consignee if missing or marked same as consignee
     if (not notify_block or re.search(r'same as consignee', notify_block, re.IGNORECASE)):
         notify_block = consignee_block
-    
+
     # Use notify party data for consignee if consignee is empty
     if not consignee_block or consignee_block.strip() == "":
         consignee_block = notify_block
+
+    # Remove embedded 'Notify Party' labels inside consignee block (we already have a CONSIGNEE header)
+    if consignee_block:
+        consignee_block = re.sub(r'(?mi)^Notify\s*Party\s*:?\s*', '', consignee_block)
+        consignee_block = re.sub(r'(?mi)^Notify\s*Party\s*[:\-]?\s*', '', consignee_block)
 
     # 🚢 SHIPMENT DETAILS
     pre_carriage = find(r'(?:Pre|Pre\-)?\s*Carriage\s*By\s*[:\-]?\s*([A-Za-z \-]+)') or find(r'Pre\-?Carriage\s*[:\-]?\s*([A-Za-z \-]+)')
@@ -193,7 +320,16 @@ def extract_invoice_data(text: str) -> dict:
         def is_allowed(line: str) -> bool:
             return any(re.search(p, line, re.IGNORECASE) for p in allowed_patterns)
         sr_filtered = []
+        # Exclude product/description-like lines (ICUMSA, PACKED, NET WEIGHT, HS CODE, measurements etc.)
+        product_exclude_patterns = [r'\bICUMSA\b', r'PACK', r'NET\s*WEIGHT', r'TOTAL', r'GROSS', r'HS\s*CODE', r'\bKGS?\b', r'\bMTS?\b', r'BAGS?', r'PP\s*BAGS', r'PACKED', r'WEIGHT']
+        def is_product_line(line: str) -> bool:
+            return any(re.search(p, line, re.IGNORECASE) for p in product_exclude_patterns)
+
         for ln in sr_lines:
+            # skip lines that clearly look like product descriptions or measurements
+            if is_product_line(ln):
+                continue
+            # capture FCL counts like '06 X 20' FCL' as compact token
             if re.search(r'\d+\s*X\s*20[\'\’\″\”\"]?\s*FCL', ln, re.IGNORECASE):
                 m = re.search(r'(\d+\s*X\s*20[\'\’\″\”\"]?\s*FCL)', ln, re.IGNORECASE)
                 if m:
@@ -201,6 +337,9 @@ def extract_invoice_data(text: str) -> dict:
                 continue
             if is_allowed(ln):
                 sr_filtered.append(ln)
+        # If filtering removed everything but container/seal exists, ensure container & seal line remains
+        if not sr_filtered and (locals().get('container_no') and locals().get('seal_no')):
+            sr_filtered = [f"Container & Seal nos.: {container_no} / {seal_no}"]
         sr_marks_block = "\n".join(sr_filtered).strip()
 
     # Capture Units (In Metric Tons), Rate Per Unit (USD), Amount (USD) from headers if present
@@ -225,7 +364,10 @@ def extract_invoice_data(text: str) -> dict:
             desc_raw = ""
         # Try to capture 1-2 lines just before the HS CODE (product names)
         pre_hs_name = ""
-        pre_hs_context = re.search(rf'([A-Z0-9 ,\-\/()]{8,240})\s*[\r\n]+\s*HS\s*CODE\s*:\s*{re.escape(hs)}', raw, FLAGS)
+        # Try to capture 1-2 lines before HS CODE; handle cases with or without newline
+        pre_hs_context = re.search(rf'([^\r\n]{{8,240}})\s*[\r\n]+\s*HS\s*CODE\s*[:\-]?\s*{re.escape(hs)}', raw, FLAGS)
+        if not pre_hs_context:
+            pre_hs_context = re.search(rf'([^\r\n]{{8,240}})\s*HS\s*CODE\s*[:\-]?\s*{re.escape(hs)}', raw, FLAGS)
         if pre_hs_context:
             pre_hs_name = pre_hs_context.group(1).strip()
         # Preserve content and newlines (trim excessive length)
@@ -259,6 +401,18 @@ def extract_invoice_data(text: str) -> dict:
         if not wm_lines and weight:
             wm_lines.append(f"WEIGHT: {weight}")
         weight_measurements = "\n".join(wm_lines)
+        # Append structured fields to description for completeness
+        extra = []
+        if qty:
+            extra.append(f"QUANTITY: {qty}")
+        if weight:
+            extra.append(f"WEIGHT: {weight}")
+        if pack:
+            extra.append(f"PACKING: {pack}")
+        if amount_usd and amount_usd != "NOT FOUND":
+            extra.append(f"AMOUNT(USD): {amount_usd}")
+        if extra:
+            desc_full = (desc_full + "\n" + "\n".join(extra)).strip()
         goods.append({
             "hs_code": hs,
             "description": desc_full,
@@ -284,11 +438,10 @@ def extract_invoice_data(text: str) -> dict:
             raw, FLAGS
         )
         desc_after_hs = desc_after_hs_match.group(1) if desc_after_hs_match else ""
-        pre_hs_match = re.search(
-            r'([A-Z0-9 ,\-\/()]{8,240})\s*\n\s*HS\s*CODE',
-            raw, FLAGS
-        )
-        pre_hs = pre_hs_match.group(1) if pre_hs_match else ""
+        pre_hs_match = re.search(r'([^\r\n]{8,240})\s*\r?\n\s*HS\s*CODE', raw, FLAGS)
+        if not pre_hs_match:
+            pre_hs_match = re.search(r'([^\r\n]{8,240})\s*HS\s*CODE', raw, FLAGS)
+        pre_hs = pre_hs_match.group(1).strip() if pre_hs_match else ""
         desc_block = (pre_hs + "\n" + desc_after_hs).strip()
         desc_block = re.sub(r'[ \t]{2,}', ' ', desc_block)
         units_guess = (total_net_match.group(1) if total_net_match else find(r'([0-9,.]+)\s*MTS?'))
@@ -325,6 +478,8 @@ def extract_invoice_data(text: str) -> dict:
             "amount": amount_guess if amount_guess else "",
             "units_mt": units_guess if units_guess else "",
             "weight_measurements": weight_measurements_fb,
+            # include some invoice hints in fallback description
+            "description_full_fallback": desc_full,
             "sr_marks": sr_marks_block
         })
 
@@ -432,11 +587,84 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
                 c.drawString(x, y - line_offset, l)
                 line_offset += 11
 
+    def draw_wrapped_box(text, x, y, max_width, max_lines=None, align='left', font='Helvetica', font_size=9):
+        """Draw wrapped text in a box. Returns height used in points.
+        align='left' or 'right' (for right, x is the right-edge coordinate).
+        """
+        if not text:
+            return 0
+        c.setFont(font, font_size)
+        paragraphs = re.split(r"\r?\n", text)
+        lines = []
+        for para in paragraphs:
+            if not para:
+                lines.append("")
+                continue
+            words = para.split()
+            line = ""
+            for word in words:
+                test = f"{line}{word} "
+                if c.stringWidth(test, font, font_size) < max_width:
+                    line = test
+                else:
+                    lines.append(line.strip())
+                    line = f"{word} "
+            if line:
+                lines.append(line.strip())
+        if max_lines is not None:
+            lines = lines[:max_lines]
+        line_height = font_size + 2
+        for i, l in enumerate(lines):
+            yy = y - (i * line_height)
+            if align == 'left':
+                c.drawString(x, yy, l)
+            else:
+                # x is right edge for right-aligned text
+                c.drawRightString(x, yy, l)
+        return len(lines) * line_height
+
     # SHIPPER
     c.setFont("Helvetica-Bold", 10)
     c.drawString(70, h - 72, "EXPORTER / SHIPPER:")
     c.setFont("Helvetica", 9)
-    draw_wrapped(data.get("exporter_name", data.get("exporter", "")), 70, h - 90, 350)
+    # Prepare exporter display values and sanitize placeholder labels
+    exp_name = (data.get("exporter_name") or "").strip()
+    exp_block = (data.get("exporter") or "").strip()
+    exp_address = (data.get("exporter_address") or "").strip()
+    # Remove invoice/PO/IE Code lines from exporter block so they don't appear in the exporter box
+    if exp_block:
+        exp_block = re.sub(r'(?mi)^\s*Invoice\s*No\.?\s*[:\-]?.*$\n?', '', exp_block)
+        exp_block = re.sub(r'(?mi)^\s*Buyer\'?s\s*Order\s*No\.?\s*[:\-]?.*$\n?', '', exp_block)
+        exp_block = re.sub(r'(?mi)^\s*I\.?E\.?\s*Code\.?\s*[:\-]?.*$\n?', '', exp_block)
+        exp_block = re.sub(r'(?mi)^\s*I\.E\.?\s*Code\.?\s*[:\-]?.*$\n?', '', exp_block)
+        exp_block = exp_block.strip()
+    # remove accidental literal headings
+    exp_name = re.sub(r'(?i)^Exporter\s*:?\s*$', '', exp_name).strip()
+    # If no clean name, try to pick first non-heading line from exporter block
+    if not exp_name:
+        lines = [ln.strip() for ln in re.split(r'[\r\n]+', exp_block) if ln.strip()]
+        for ln in lines:
+            if not re.search(r'^(INVOICE|EXPORTER|SHIPPER|BILL|DATE|TAX)$', ln, re.IGNORECASE):
+                exp_name = ln
+                break
+        if not exp_name and lines:
+            exp_name = lines[0]
+        # set address from remaining lines if not already set
+        if lines and not exp_address:
+            try:
+                idx = lines.index(exp_name)
+                exp_address = "\n".join(lines[idx+1:]).strip()
+            except Exception:
+                exp_address = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+
+    # Draw exporter name (bold) then address (regular)
+    exp_y_top = h - 96
+    if exp_name:
+        c.setFont("Helvetica-Bold", 9)
+        draw_wrapped(exp_name, 70, exp_y_top, 350)
+    if exp_address:
+        c.setFont("Helvetica", 9)
+        draw_wrapped(exp_address, 70, exp_y_top - 18, 350)
 
     # CONSIGNEE
     c.setFont("Helvetica-Bold", 10)
@@ -489,20 +717,62 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
     desc_box_x = 330
     right_box_x = max(w - 200, 520)
     y_start = h - 590
-    for i, good in enumerate(data.get("goods", [])):
-        row_y = y_start - (i * 115)
+    # If container/seal present, draw FCL token and the container heading + numbers once at the top-left
+    c_no = data.get('container_no', '')
+    s_no = data.get('seal_no', '')
+    fcl_token = ''
+    goods_list_for_fcl = data.get('goods', [])
+    if goods_list_for_fcl:
+        possible_sr = goods_list_for_fcl[0].get('sr_marks', '') or ''
+        m_fcl = re.search(r"(\d+\s*X\s*20[\'\’\″\”\"]?\s*FCL)", possible_sr, re.IGNORECASE)
+        if m_fcl:
+            fcl_token = m_fcl.group(1)
+
+    if fcl_token or (c_no and s_no):
+        top_container_y = y_start + 10
+        line_h = 11
         c.setFont("Helvetica", 9)
-        # Sr No & Marks – left column
+        if fcl_token:
+            draw_wrapped(fcl_token, left_box_x, top_container_y, 200)
+            top_container_y -= line_h
+        if c_no and s_no:
+            c.setFont("Helvetica-Bold", 8)
+            draw_wrapped("Container & Seal nos.:", left_box_x, top_container_y, 200)
+            top_container_y -= line_h
+            c.setFont("Helvetica", 8)
+            draw_wrapped(f"{c_no} / {s_no}", left_box_x, top_container_y, 200)
+
+    for i, good in enumerate(data.get("goods", [])):
+        # push first row down slightly to avoid overlap with top container line
+        row_y = y_start - (i * 115) - (20 if (i == 0 and (fcl_token or (c_no and s_no))) else 0)
+        c.setFont("Helvetica", 9)
+        # Sr No & Marks – left column (remove any container/seal fragments and FCL tokens)
         sr_text = good.get('sr_marks') or ''
-        # Always include container & seal if available
-        if data.get('container_no') and data.get('seal_no'):
-            extra = f"Container & Seal nos.: {data.get('container_no')} / {data.get('seal_no')}"
-            if extra not in sr_text:
-                sr_text = f"{sr_text}\n{extra}".strip()
         if sr_text:
-            draw_wrapped(sr_text, left_box_x, row_y, 200)
-        # Description of Goods – middle column (narrower width, multiline safe)
-        draw_wrapped(good.get('description',''), desc_box_x, row_y, 430)
+            # remove container & seal and FCL occurrences to avoid duplication
+            sr_clean = re.sub(r'Container\s*&\s*Seal\s*nos?\.?[:\-]?\s*.*', '', sr_text, flags=re.IGNORECASE).strip()
+            sr_clean = re.sub(r"(\d+\s*X\s*20[\'\’\″\”\"]?\s*FCL)", '', sr_clean, flags=re.IGNORECASE).strip()
+            if sr_clean:
+                draw_wrapped(sr_clean, left_box_x, row_y, 200)
+        # Description of Goods – middle column (preserve pre-HS line above HS CODE)
+        desc = good.get('description','') or ''
+        # Normalize newlines and split
+        desc_lines = [ln.strip() for ln in re.split(r'\r?\n', desc) if ln.strip()]
+        # If description contains HS CODE as a line, try to move any product-name lines above it
+        hs_idx = None
+        for idx, ln in enumerate(desc_lines):
+            if re.search(r'HS\s*CODE', ln, re.IGNORECASE):
+                hs_idx = idx
+                break
+        ordered_desc = []
+        if hs_idx is not None:
+            # lines before HS -> product name(s)
+            ordered_desc.extend(desc_lines[:hs_idx])
+            ordered_desc.append(desc_lines[hs_idx])
+            ordered_desc.extend(desc_lines[hs_idx+1:])
+        else:
+            ordered_desc = desc_lines
+        draw_wrapped('\n'.join(ordered_desc), desc_box_x, row_y, 430)
         # Numeric columns – units and rate only (no amount in this column)
         units_x = right_box_x
         rate_x = units_x + 100
@@ -514,22 +784,33 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
             wm_x = max(w - 155, rate_x + 120)
             draw_wrapped(wm, wm_x, row_y, 140)
 
-    # No explicit total amount printed to keep Weight & Measurements column clean
-
-    # Footer box: Delivery Agent (left) and Place & Date (right) – move up
-    # Position headings exactly inside the footer boxes to avoid overlap
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(70, 110, "DELIVERY AGENT:")
-    c.setFont("Helvetica", 9)
-    draw_wrapped(data.get("delivery_agent", ""), 200, 110, 420)
+    # Footer box: Delivery Agent (left) and Place & Date (right) – placed inside footer box with better spacing
+    footer_y = 190  # slightly higher so headings and data fit neatly inside footer box
+    # Delivery Agent: heading above the agent block
+    heading_font = "Helvetica-Bold"
+    heading_size = 10
+    data_font = "Helvetica"
+    data_size = 9
+    # Draw heading (above) then data (below) with wrapping limits
+    heading_y = footer_y + 18
+    data_y = footer_y - 6
+    c.setFont(heading_font, heading_size)
+    c.drawString(70, heading_y, "DELIVERY AGENT:")
+    c.setFont(data_font, data_size)
+    # left area: start at x=200, width ~420, limit to 3 lines to avoid overflow
+    draw_wrapped_box(data.get("delivery_agent", ""), 200, data_y, 420, max_lines=3, align='left', font=data_font, font_size=data_size)
 
     from datetime import datetime
     place = (data.get("port_of_loading") or data.get("place_of_receipt") or "").strip()
     today = datetime.now().strftime("%d-%m-%Y")
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(w - 250, 96, "PLACE & DATE:")
-    c.setFont("Helvetica", 9)
-    c.drawRightString(w - 70, 96, f"{place}  {today}")
+    place_date_text = f"{place}  {today}" if place else today
+
+    # Place & Date: heading above the date block on the right
+    c.setFont(heading_font, heading_size)
+    c.drawRightString(w - 70, heading_y, "PLACE & DATE:")
+    c.setFont(data_font, data_size)
+    # right-edge is w - 70; limit to 2 lines and align right
+    draw_wrapped_box(place_date_text, w - 70, data_y, 180, max_lines=2, align='right', font=data_font, font_size=data_size)
 
     c.save()
     return buffer.getvalue()
