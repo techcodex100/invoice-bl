@@ -64,7 +64,7 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
     c.setFont("Helvetica-Bold", 10)
     c.drawString(70, h - 72, "EXPORTER / SHIPPER:")
     c.setFont("Helvetica", 9)
-    draw_wrapped(data.get("exporter", ""), 70, h - 90, 350)
+    draw_wrapped(data.get("exporter_name", data.get("exporter", "")), 70, h - 90, 350)
 
     c.setFont("Helvetica-Bold", 10)
     c.drawString(70, h - 200, "CONSIGNEE:")
@@ -90,7 +90,7 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
     c.setFont("Helvetica-Bold", 10)
     c.drawString(70, h - 460, "PLACE OF ACCEPTANCE:")
     c.setFont("Helvetica", 9)
-    draw_wrapped(data.get("pre_carriage_by", ""), 160, h - 430, 300)
+    draw_wrapped(data.get("port_of_loading", ""), 160, h - 430, 300)
 
     # VESSEL / B/L NO.
     c.setFont("Helvetica-Bold", 10)
@@ -123,12 +123,19 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
     c.drawString(70, 110, "DELIVERY AGENT:")
     c.setFont("Helvetica", 9)
     draw_wrapped(data.get("delivery_agent", ""), 200, 110, 420)
+    
+    # PLACE OF DELIVERY
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(70, 90, "PLACE OF DELIVERY:")
+    c.setFont("Helvetica", 9)
+    draw_wrapped(data.get("port_of_discharge", ""), 200, 90, 420)
+    
     place = (data.get("port_of_loading") or data.get("place_of_receipt") or "").strip()
     today = datetime.now().strftime("%d-%m-%Y")
     c.setFont("Helvetica-Bold", 10)
-    c.drawString(w - 250, 96, "PLACE & DATE:")
+    c.drawString(w - 250, 76, "PLACE & DATE:")
     c.setFont("Helvetica", 9)
-    c.drawRightString(w - 70, 96, f"{place}  {today}")
+    c.drawRightString(w - 70, 76, f"{place}  {today}")
 
     c.save()
     return buffer.getvalue()
