@@ -859,16 +859,18 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
     right_box_x = max(w - 200, 520)
     y_start = h - 590
     # If container/seal present, draw FCL token and the container heading + numbers once at the top-left
+ # Extract FCL count and prepare container/seal data
     c_no = data.get('container_no', '')
     s_no = data.get('seal_no', '')
     fcl_token = ''
+    fcl_count = 6  # default to 1 container
     goods_list_for_fcl = data.get('goods', [])
     if goods_list_for_fcl:
         possible_sr = goods_list_for_fcl[0].get('sr_marks', '') or ''
         m_fcl = re.search(r"(\d+\s*X\s*20[\'\’\″\”\"]?\s*FCL)", possible_sr, re.IGNORECASE)
         if m_fcl:
             fcl_token = m_fcl.group(1)
-
+    # Draw FCL token once at the top
     if fcl_token or (c_no and s_no):
         top_container_y = y_start + 10
         line_h = 11
@@ -876,12 +878,28 @@ def generate_bl_pdf(data: dict, template_path="image.jpeg") -> bytes:
         if fcl_token:
             draw_wrapped(fcl_token, left_box_x, top_container_y, 200)
             top_container_y -= line_h
+        
+        # Draw container & seal information multiple times based on FCL count
         if c_no and s_no:
             c.setFont("Helvetica-Bold", 8)
             draw_wrapped("Container & Seal nos.:", left_box_x, top_container_y, 200)
             top_container_y -= line_h
             c.setFont("Helvetica", 8)
-            draw_wrapped(f"{c_no} / {s_no}", left_box_x, top_container_y, 200)
+            
+            # Repeat container/seal numbers based on FCL count
+            for i in range(fcl_count):
+                # Generate unique container and seal numbers for each
+                if i == 0:
+                    # Use the original numbers for the first one
+                    container = c_no
+                    seal = s_no
+                else:
+                    # Generate new random numbers for additional containers
+                    container = ''.join(random.choices(string.ascii_uppercase, k=4)) + ''.join(random.choices(string.digits, k=7))
+                    seal = ''.join(random.choices(string.digits, k=6))
+                
+                draw_wrapped(f"{container} / {seal}", left_box_x, top_container_y, 200)
+                top_container_y -= line_h
 
     for i, good in enumerate(data.get("goods", [])):
         # push first row down slightly to avoid overlap with top container line
